@@ -354,14 +354,17 @@ function discoverGatewayPorts() {
 let gatewayPorts = discoverGatewayPorts();
 console.log('[Gateway] Discovered ports:', gatewayPorts);
 
-// Refresh on config changes (watch profiles dir)
+// Refresh on config changes (watch profiles dir — only if it exists and is non-empty)
 try {
-  fs.watch(path.join(HERMES_HOME, 'profiles'), { recursive: true }, (event, filename) => {
-    if (filename?.endsWith('config.yaml')) {
-      gatewayPorts = discoverGatewayPorts();
-      console.log('[Gateway] Ports refreshed:', gatewayPorts);
-    }
-  });
+  const profilesDir = path.join(HERMES_HOME, 'profiles');
+  if (fs.existsSync(profilesDir) && fs.readdirSync(profilesDir).length > 0) {
+    fs.watch(profilesDir, { recursive: true }, (event, filename) => {
+      if (filename?.endsWith('config.yaml')) {
+        gatewayPorts = discoverGatewayPorts();
+        console.log('[Gateway] Ports refreshed:', gatewayPorts);
+      }
+    });
+  }
 } catch (_) { /* fs.watch not supported */ }
 
 function getGatewayBase(profile) {
@@ -3710,33 +3713,8 @@ app.get('/api/memory/:profile', requireAuth, async (req, res) => {
       shell(`cat "${home}/SOUL.md" 2>/dev/null || echo ""`),
       shell(`cat "${home}/honcho.json" 2>/dev/null || echo ""`),
     ]);
-    // Check Honcho connection via hermes CLI
-    let honcho_data = { connected: false };
-    try {
-      const honchoStatus = await shell(`hermes honcho --target-profile ${profile} status 2>&1`);
-      const lines = honchoStatus.split('\n');
-      honcho_data.connected = honchoStatus.includes('Connection... OK');
-      honcho_data.enabled = honchoStatus.includes('Enabled:        True');
-      const getVal = (key) => {
-        const line = lines.find(l => l.trim().startsWith(key + ':'));
-        return line ? line.split(':').slice(1).join(':').trim() : '';
-      };
-      honcho_data.profile = getVal('Profile');
-      honcho_data.host = getVal('Host');
-      honcho_data.workspace = getVal('Workspace');
-      honcho_data.ai_peer = getVal('AI peer');
-      honcho_data.user_peer = getVal('User peer');
-      honcho_data.session_key = getVal('Session key');
-      honcho_data.recall_mode = getVal('Recall mode');
-      honcho_data.write_freq = getVal('Write freq');
-      honcho_data.config_path = getVal('Config path');
-      // Extract first few lines of representation
-      const reprStart = lines.findIndex(l => l.includes('AI peer representation:'));
-      if (reprStart > -1) {
-        honcho_data.representation = lines.slice(reprStart + 1, reprStart + 6)
-          .map(l => l.trim()).filter(Boolean).join(' ').substring(0, 200);
-      }
-    } catch { honcho_data = { connected: false }; }
+    // honcho not available in this Hermes version — skip to avoid 15s timeout
+    const honcho_data = { connected: false };
     res.json({
       ok: true,
       memory_chars: memoryContent.length,
@@ -3759,9 +3737,73 @@ app.get('/api/memory/:profile', requireAuth, async (req, res) => {
 // Skills browse (paginated)
 app.get('/api/skills/browse/:page', requireAuth, async (req, res) => {
   try {
+    const PAGE_SIZE = 20;
     const page = Math.max(1, parseInt(req.params.page) || 1);
-    const output = await execHermes(['skills', 'browse', '--page', String(page)], 15000);
-    res.json({ ok: true, output, page });
+    const hermesHome = process.env.HERMES_HOME || path.join(os.homedir(), '.hermes');
+
+    // Read skills directly from filesystem — avoids fragile CLI table parsing
+    const allSkills = [];
+
+    // 1) Local user skills (~/.hermes/skills/)
+    const localDir = path.join(hermesHome, 'skills');
+    if (fs.existsSync(localDir)) {
+      for (const cat of fs.readdirSync(localDir)) {
+        const catPath = path.join(localDir, cat);
+        if (!fs.statSync(catPath).isDirectory()) continue;
+        for (const skill of fs.readdirSync(catPath)) {
+          const skillMd = path.join(catPath, skill, 'SKILL.md');
+          if (!fs.existsSync(skillMd)) continue;
+          let desc = '';
+          try {
+            const raw = fs.readFileSync(skillMd, 'utf8');
+            const m = raw.match(/^description:\s*["']?(.+?)["']?\s*$/m);
+            if (m) desc = m[1].replace(/^["']|["']$/g, '');
+          } catch {}
+          allSkills.push({ name: skill, category: cat, description: desc, source: 'local', trust: 'local' });
+        }
+      }
+    }
+
+    // 2) Optional builtin skills (~/.hermes/hermes-agent/optional-skills/)
+    const optDir = path.join(hermesHome, 'hermes-agent', 'optional-skills');
+    if (fs.existsSync(optDir)) {
+      for (const cat of fs.readdirSync(optDir)) {
+        const catPath = path.join(optDir, cat);
+        if (!fs.statSync(catPath).isDirectory()) continue;
+        for (const skill of fs.readdirSync(catPath)) {
+          const skillMd = path.join(catPath, skill, 'SKILL.md');
+          if (!fs.existsSync(skillMd)) continue;
+          let desc = '';
+          try {
+            const raw = fs.readFileSync(skillMd, 'utf8');
+            const m = raw.match(/^description:\s*["']?(.+?)["']?\s*$/m);
+            if (m) desc = m[1].replace(/^["']|["']$/g, '');
+          } catch {}
+          allSkills.push({ name: skill, category: cat, description: desc, source: 'optional', trust: 'builtin' });
+        }
+      }
+    }
+
+    allSkills.sort((a, b) => a.name.localeCompare(b.name));
+    const totalPages = Math.max(1, Math.ceil(allSkills.length / PAGE_SIZE));
+    const slice = allSkills.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE);
+
+    // Emit table format the frontend parser expects
+    const rows = slice.map((s, i) => {
+      const num = String((page - 1) * PAGE_SIZE + i + 1).padStart(5);
+      const name = s.name.padEnd(20).slice(0, 20);
+      const desc = (s.description || '').padEnd(40).slice(0, 40);
+      const src  = s.source.padEnd(10);
+      const trust = s.trust;
+      return `│${num} │ ${name} │ ${desc} │ ${src} │ ${trust} │`;
+    });
+    const output = [
+      `Skills Hub — Browse — all sources  (${allSkills.length} skills loaded, page ${page}/${totalPages})`,
+      '',
+      ...rows,
+    ].join('\n');
+
+    res.json({ ok: true, output, page, skills: slice, totalPages });
   } catch (e) {
     res.json({ ok: false, error: e.message });
   }
@@ -5233,9 +5275,13 @@ process.on('unhandledRejection', (reason, promise) => {
   log('system.error', `unhandled rejection: ${reason?.message || reason}`);
 });
 process.on('uncaughtException', (err) => {
+  // Non-fatal: fs watcher ENOENT when watched dirs are deleted/renamed
+  if (err.code === 'ENOENT' || err.code === 'EPERM' || err.code === 'EACCES') {
+    console.warn('[UNCAUGHT EXCEPTION — non-fatal, continuing]', err.code, err.path || err.message);
+    return;
+  }
   console.error('[UNCAUGHT EXCEPTION]', err);
   log('system.error', `uncaught exception: ${err.message}`);
-  // Give time to log, then exit
   setTimeout(() => process.exit(1), 1000);
 });
 
